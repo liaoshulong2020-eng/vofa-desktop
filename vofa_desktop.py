@@ -2,10 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- VOFA+ Native Desktop Pro (全协议盲解 / X轴静止滚动 / 0闪烁极速版)
- Fixes:
-   1. 彻底解决“坐标轴在动”：将 X 轴范围锁定在固定视窗 [-total_window_ms, 0]，刻度线 (-1000ms..0ms) 坚如磐石静止不动，新波形从右侧 0ms 顺畅向左涌入！
-   2. 彻底解决“没有波形”：新增 [Auto 智能全协议盲解] 引擎为默认协议！自动识别 JustFloat (00 00 80 7F 尾包)、FireWater 文本 (CH0:1.2,CH1:3.4)、Raw ASCII 文本与 Raw Float32 裸流！
+ VOFA+ Native Desktop Pro (官方 1:1 “三点式” X轴自由缩放与历史视窗控件版)
+ Features:
+   1. 官方 1:1 三点式双向 X 轴范围缩放器 (VofaRangeSlider):
+      - 左侧控制点 (Left Dot): 自由拉伸 X 轴左边界。
+      - 右侧控制点 (Right Dot): 自由拉伸 X 轴右边界。
+      - 中间滑块/控制点 (Middle Dot): 整体拖拽 X 轴视窗在 50 万点历史缓冲区中前后平移。
+      - 右侧附带 Auto 标志与通道彩色指示点 (Red, Green, Purple)。
+   2. 交互式全联动：
+      - 拖动三点滑块时，图表 X 轴视窗与右侧刻度瞬间 1:1 动态伸缩。
+      - 滚动鼠标滚轮可实时缩放。
+   3. 原生 PyQtGraph C++ OpenGL 加速 + 智能全协议盲解。
 ==============================================================================
 """
 
@@ -21,18 +28,17 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRectF, QPointF
+from PyQt5.QtGui import QFont, QColor, QPen, QPainter, QBrush, QCursor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QComboBox, QLineEdit, QPushButton,
     QCheckBox, QSplitter, QTextEdit, QGroupBox, QSpinBox, QDoubleSpinBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QColorDialog, QSlider
+    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QColorDialog
 )
 
 import pyqtgraph as pg
 
-# Configure PyQtGraph Dark Theme & High-Speed Rendering
 pg.setConfigOption('background', '#080c14')
 pg.setConfigOption('foreground', '#8492a6')
 pg.setConfigOptions(antialias=False)
@@ -42,7 +48,142 @@ DEFAULT_RING_BUFFER_SIZE = 500000
 
 
 # ==============================================================================
-# 1. PyQtGraph Fixed-Axis Scrolling Plotter Engine
+# 0. Authentic VOFA+ 3-Dot X-Axis Range Selector Slider (三点式双向范围调节器)
+# ==============================================================================
+class VofaRangeSlider(QWidget):
+    rangeChanged = pyqtSignal(float, float)  # (left_ratio, right_ratio)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(28)
+        self.left_ratio = 0.8   # 0.0 to 1.0
+        self.right_ratio = 1.0  # 0.0 to 1.0
+
+        self.active_handle = None  # 'left', 'right', 'middle'
+        self.drag_start_x = 0
+        self.drag_start_left = 0.8
+        self.drag_start_right = 1.0
+
+        self.channel_dots = ['#ff0055', '#00ff87', '#9d4edd']
+
+    def set_ratios(self, left, right):
+        self.left_ratio = max(0.0, min(0.99, left))
+        self.right_ratio = max(self.left_ratio + 0.01, min(1.0, right))
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            x = event.x()
+            w = max(1, self.width() - 80) # Leave 80px for right side dots
+            x_left = int(self.left_ratio * w)
+            x_right = int(self.right_ratio * w)
+
+            # Check handle hits (12px hit radius)
+            if abs(x - x_left) <= 10:
+                self.active_handle = 'left'
+            elif abs(x - x_right) <= 10:
+                self.active_handle = 'right'
+            elif x_left < x < x_right:
+                self.active_handle = 'middle'
+            else:
+                # Click outside: move right handle or left handle
+                click_ratio = max(0.0, min(1.0, x / float(w)))
+                if click_ratio > self.right_ratio:
+                    span = self.right_ratio - self.left_ratio
+                    self.right_ratio = click_ratio
+                    self.left_ratio = max(0.0, click_ratio - span)
+                else:
+                    span = self.right_ratio - self.left_ratio
+                    self.left_ratio = click_ratio
+                    self.right_ratio = min(1.0, click_ratio + span)
+                self.active_handle = 'middle'
+
+            self.drag_start_x = x
+            self.drag_start_left = self.left_ratio
+            self.drag_start_right = self.right_ratio
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        w = max(1, self.width() - 80)
+        x = event.x()
+
+        if self.active_handle:
+            dx = (x - self.drag_start_x) / float(w)
+
+            if self.active_handle == 'left':
+                self.left_ratio = max(0.0, min(self.right_ratio - 0.02, self.drag_start_left + dx))
+            elif self.active_handle == 'right':
+                self.right_ratio = max(self.left_ratio + 0.02, min(1.0, self.drag_start_right + dx))
+            elif self.active_handle == 'middle':
+                span = self.drag_start_right - self.drag_start_left
+                new_left = max(0.0, min(1.0 - span, self.drag_start_left + dx))
+                self.left_ratio = new_left
+                self.right_ratio = new_left + span
+
+            self.rangeChanged.emit(self.left_ratio, self.right_ratio)
+            self.update()
+        else:
+            # Change hover cursor
+            x_left = int(self.left_ratio * w)
+            x_right = int(self.right_ratio * w)
+            if abs(x - x_left) <= 10 or abs(x - x_right) <= 10:
+                self.setCursor(Qt.SizeHorCursor)
+            elif x_left < x < x_right:
+                self.setCursor(Qt.SizeAllCursor)
+            else:
+                self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        self.active_handle = None
+        self.setCursor(Qt.ArrowCursor)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        w = max(1, self.width() - 80)
+        h = self.height()
+
+        # 1. Background Groove
+        groove_y = int(h / 2 - 3)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#182030"))
+        painter.drawRoundedRect(0, groove_y, w, 6, 3, 3)
+
+        # 2. Active Window Region
+        x_left = int(self.left_ratio * w)
+        x_right = int(self.right_ratio * w)
+        painter.setBrush(QColor(0, 243, 255, 160))
+        painter.drawRoundedRect(x_left, groove_y, max(4, x_right - x_left), 6, 3, 3)
+
+        # 3. Draw The 3 Control Handles (Dot 1, Dot 2, Dot 3)
+        # Dot 1: Left Handle
+        painter.setBrush(QColor("#00f3ff"))
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.drawEllipse(QPointF(x_left, h / 2), 6, 6)
+
+        # Dot 2: Right Handle
+        painter.drawEllipse(QPointF(x_right, h / 2), 6, 6)
+
+        # Dot 3: Middle Active Handle
+        x_mid = (x_left + x_right) / 2.0
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawEllipse(QPointF(x_mid, h / 2), 4, 4)
+
+        # 4. Draw Right Side Official VOFA+ Auto Indicator & Colored Channel Dots
+        rw = self.width() - w
+        painter.setFont(QFont("JetBrains Mono", 9, QFont.Bold))
+        painter.setPen(QColor("#00ff87"))
+        painter.drawText(w + 6, int(h / 2 + 4), "Auto")
+
+        dot_x = w + 46
+        for i, color_hex in enumerate(self.channel_dots):
+            painter.setBrush(QColor(color_hex))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QPointF(dot_x + i * 11, h / 2), 4, 4)
+
+
+# ==============================================================================
+# 1. PyQtGraph Official-Style Plotter Engine
 # ==============================================================================
 class PyqtGraphVofaPlotter(pg.PlotWidget):
     def __init__(self, parent=None):
@@ -142,7 +283,6 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
             return
 
         total_window_ms = float(self.view_pts * self.dt_ms)
-        # Fix X-axis viewport Range: LOCK EXACTLY to [-total_window_ms, 0] so axis labels NEVER jitter or move!
         self.setXRange(-total_window_ms, 0.0, padding=0)
 
         with self.buffer_lock:
@@ -163,7 +303,6 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
             gains = self.ch_gain.copy()
             y_offsets = self.ch_y_offset.copy()
 
-        # Map X values cleanly from right edge (0.0 ms) extending leftwards (- (n_pts - 1) * dt_ms)
         x_vals = np.linspace(- (n_pts - 1) * self.dt_ms, 0.0, n_pts)
 
         for ch_idx in range(MAX_CHANNELS):
@@ -218,7 +357,6 @@ class HighSpeedSerialWorker:
         return False
 
     def _worker_loop(self):
-        # 1. SIMULATOR MODE
         if self.port_name == 'SIMULATOR':
             sim_t = 0.0
             tail = b'\x00\x00\x80\x7f'
@@ -249,7 +387,6 @@ class HighSpeedSerialWorker:
                 time.sleep(0.001)
             return
 
-        # 2. HARDWARE COM PORT MODE
         ser = None
         try:
             ser = serial.Serial()
@@ -284,11 +421,9 @@ class HighSpeedSerialWorker:
 
                     self.raw_bytes += len(chunk)
 
-                    # Universal Auto Protocol Detector & Decoder
                     if self.protocol in ['auto', 'justfloat']:
                         self.byte_buf.extend(chunk)
 
-                        # Step 1: Match 0x00 0x00 0x80 0x7F JustFloat tail
                         parsed_justfloat = False
                         while True:
                             idx = self.byte_buf.find(tail)
@@ -311,7 +446,6 @@ class HighSpeedSerialWorker:
                                 except Exception:
                                     pass
 
-                        # Step 2: Text / FireWater Fallback
                         if not parsed_justfloat and (b':' in self.byte_buf or b',' in self.byte_buf or b'\n' in self.byte_buf):
                             try:
                                 text = self.byte_buf.decode('utf-8', errors='ignore')
@@ -339,7 +473,6 @@ class HighSpeedSerialWorker:
                             except Exception:
                                 pass
 
-                        # Step 3: Raw Float32 Fallback
                         elif not parsed_justfloat and len(self.byte_buf) >= 16:
                             rem = len(self.byte_buf) % 4
                             n_bytes = len(self.byte_buf) - rem
@@ -361,7 +494,6 @@ class HighSpeedSerialWorker:
                         if len(self.byte_buf) > 16384:
                             self.byte_buf.clear()
 
-                        # Flush batch into ring buffer
                         if len(batch_channels) >= 10 or (len(batch_channels) > 0 and ser.in_waiting == 0):
                             with self.plotter_ref.buffer_lock:
                                 buf_size = self.plotter_ref.buffer_size
@@ -376,7 +508,7 @@ class HighSpeedSerialWorker:
                                     self.plotter_ref.write_head += 1
                             batch_channels.clear()
 
-                    else: # Pure FireWater or Text Mode
+                    else:
                         try:
                             text = chunk.decode('utf-8', errors='ignore')
                         except Exception:
@@ -435,7 +567,7 @@ class VofaDesktopApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("VOFA+ Native Desktop Ultimate | 伏特加上位机 (全协议盲解 / 0闪烁版)")
+        self.setWindowTitle("VOFA+ Native Desktop Ultimate | 伏特加上位机 (三点式 X 轴自由双向放缩版)")
         self.resize(1340, 850)
 
         self.worker = None
@@ -516,22 +648,6 @@ class VofaDesktopApp(QMainWindow):
                 font-family: 'JetBrains Mono', monospace;
                 font-size: 11px;
                 color: #00ff87;
-            }
-            QSlider::groove:horizontal {
-                height: 6px;
-                background: #182030;
-                border-radius: 3px;
-            }
-            QSlider::sub-page:horizontal {
-                background: #00f3ff;
-                border-radius: 3px;
-            }
-            QSlider::handle:horizontal {
-                background: #ffffff;
-                width: 14px;
-                margin-top: -4px;
-                margin-bottom: -4px;
-                border-radius: 7px;
             }
         """)
 
@@ -645,20 +761,17 @@ class VofaDesktopApp(QMainWindow):
         tb_layout.addWidget(self.btn_auto_scroll)
 
         tb_layout.addStretch()
-
         center_layout.addLayout(tb_layout)
 
-        # Historical Progress Slider
+        # Authentic VOFA+ 3-Dot X-Axis Range Selector Slider
         hist_layout = QHBoxLayout()
         self.lbl_hist_info = QLabel("0 / 500000 | 60.0 FPS | 100ms/div")
         self.lbl_hist_info.setStyleSheet("color: #8492a6; font-family: 'JetBrains Mono';")
         hist_layout.addWidget(self.lbl_hist_info)
 
-        self.slider_hist = QSlider(Qt.Horizontal)
-        self.slider_hist.setRange(0, 1000)
-        self.slider_hist.setValue(1000)
-        self.slider_hist.valueChanged.connect(self.on_slider_hist_changed)
-        hist_layout.addWidget(self.slider_hist, stretch=1)
+        self.range_slider = VofaRangeSlider()
+        self.range_slider.rangeChanged.connect(self.on_range_slider_changed)
+        hist_layout.addWidget(self.range_slider, stretch=1)
 
         center_layout.addLayout(hist_layout)
         splitter.addWidget(center_widget)
@@ -874,13 +987,23 @@ class VofaDesktopApp(QMainWindow):
 
     def restore_auto_scroll(self):
         self.plotter.history_offset = 0
-        self.slider_hist.setValue(1000)
+        self.range_slider.set_ratios(0.8, 1.0)
 
-    def on_slider_hist_changed(self, val):
+    def on_range_slider_changed(self, left_ratio, right_ratio):
         head = self.plotter.write_head
-        if head > 1000:
-            ratio = 1.0 - (val / 1000.0)
-            self.plotter.history_offset = int(ratio * (head - self.plotter.view_pts))
+        if head > 100:
+            new_view_pts = max(50, int((right_ratio - left_ratio) * min(head, self.plotter.buffer_size)))
+            self.plotter.view_pts = new_view_pts
+
+            self.spin_view_pts.blockSignals(True)
+            self.spin_view_pts.setValue(new_view_pts)
+            self.spin_view_pts.blockSignals(False)
+
+            if right_ratio < 0.99:
+                history_span = head - new_view_pts
+                self.plotter.history_offset = int((1.0 - right_ratio) * history_span)
+            else:
+                self.plotter.history_offset = 0
 
     def render_loop_60fps(self):
         if self.btn_pause.isChecked() or not self.worker or not self.worker.is_running:
