@@ -2,21 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- VOFA+ Native Desktop Ultimate (官方 VOFA+ 像素级 1:1 功能全复刻版)
- Features:
-   1. 底部时间轴与缓冲区控制栏 (对应官方界面):
-      - Δt (ms) 采样间隔设置 (动态转换 X 轴为真实的 -1000ms 到 0ms 相对时间轴)。
-      - 缓冲区上限 (默认 500,000 点/通道)。
-      - Auto 点数对齐 (视窗波形长度调整，范围 50 - 100,000 点，完美解决波形长度调节)。
-      - 历史回放滑动条 (显示 500000 / 500000 进度与 ms/div 刻度，支持拖拽历史回溯与 Auto 恢复实时)。
-   2. 右侧数据与通道增强控制面板:
-      - 自定义通道名称 (支持修改 CH0 为 v_sync, vbus_notch_filter 等)。
-      - 自定义通道颜色选择器。
-      - 通道增益 (Gain, 默认 1.0) 与 Y 偏置 (Y Offset) / X 偏置 (X Offset) 独立控制。
-      - 一键重置通道偏置与增益。
-   3. 底部串口指令发送栏 (Command TX Dock):
-      - 串口指令文本框，支持 \\n / \\r\\n / HEX 模式发送与 Enter 快捷键。
-   4. 原生 PyQtGraph C++ 硬件加速 PlotWidget (60 FPS 满屏无缝滚轴)。
+ VOFA+ Native Desktop Pro (全协议盲解 / X轴静止滚动 / 0闪烁极速版)
+ Fixes:
+   1. 彻底解决“坐标轴在动”：将 X 轴范围锁定在固定视窗 [-total_window_ms, 0]，刻度线 (-1000ms..0ms) 坚如磐石静止不动，新波形从右侧 0ms 顺畅向左涌入！
+   2. 彻底解决“没有波形”：新增 [Auto 智能全协议盲解] 引擎为默认协议！自动识别 JustFloat (00 00 80 7F 尾包)、FireWater 文本 (CH0:1.2,CH1:3.4)、Raw ASCII 文本与 Raw Float32 裸流！
 ==============================================================================
 """
 
@@ -53,7 +42,7 @@ DEFAULT_RING_BUFFER_SIZE = 500000
 
 
 # ==============================================================================
-# 1. PyQtGraph Official-Style Plotter Engine
+# 1. PyQtGraph Fixed-Axis Scrolling Plotter Engine
 # ==============================================================================
 class PyqtGraphVofaPlotter(pg.PlotWidget):
     def __init__(self, parent=None):
@@ -85,7 +74,7 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
         self.view_pts = 1000
         self.dt_ms = 1.0
         self.is_paused = False
-        self.history_offset = 0  # 0 means live auto-scroll
+        self.history_offset = 0
 
         self.channel_colors = [
             '#00f3ff', '#00ff87', '#ffaa00', '#ff007f', 
@@ -152,6 +141,10 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
         if self.is_paused:
             return
 
+        total_window_ms = float(self.view_pts * self.dt_ms)
+        # Fix X-axis viewport Range: LOCK EXACTLY to [-total_window_ms, 0] so axis labels NEVER jitter or move!
+        self.setXRange(-total_window_ms, 0.0, padding=0)
+
         with self.buffer_lock:
             head = self.write_head
             if head < 2:
@@ -170,11 +163,8 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
             gains = self.ch_gain.copy()
             y_offsets = self.ch_y_offset.copy()
 
-        # Convert sample count to relative time in milliseconds: - (n_pts - 1) * dt to 0 ms
-        t_start_ms = - (n_pts - 1) * self.dt_ms
-        t_end_ms = 0.0
-        self.setXRange(t_start_ms, t_end_ms, padding=0)
-        x_vals = np.linspace(t_start_ms, t_end_ms, n_pts)
+        # Map X values cleanly from right edge (0.0 ms) extending leftwards (- (n_pts - 1) * dt_ms)
+        x_vals = np.linspace(- (n_pts - 1) * self.dt_ms, 0.0, n_pts)
 
         for ch_idx in range(MAX_CHANNELS):
             curve = self.curves[ch_idx]
@@ -188,10 +178,10 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
 
 
 # ==============================================================================
-# 2. High-Speed Serial Worker Thread
+# 2. Universal Auto-Detecting Serial Worker Engine
 # ==============================================================================
 class HighSpeedSerialWorker:
-    def __init__(self, port_name, baud_rate, protocol='justfloat'):
+    def __init__(self, port_name, baud_rate, protocol='auto'):
         self.port_name = port_name
         self.baud_rate = baud_rate
         self.protocol = protocol
@@ -205,6 +195,7 @@ class HighSpeedSerialWorker:
         self.last_error = ""
 
         self.plotter_ref = None
+        self.ser_obj = None
 
     def start(self, plotter):
         self.plotter_ref = plotter
@@ -218,7 +209,7 @@ class HighSpeedSerialWorker:
             self.thread.join(timeout=1.0)
 
     def send_cmd(self, cmd_bytes):
-        if hasattr(self, 'ser_obj') and self.ser_obj and self.ser_obj.is_open:
+        if self.ser_obj and self.ser_obj.is_open:
             try:
                 self.ser_obj.write(cmd_bytes)
                 return True
@@ -227,6 +218,7 @@ class HighSpeedSerialWorker:
         return False
 
     def _worker_loop(self):
+        # 1. SIMULATOR MODE
         if self.port_name == 'SIMULATOR':
             sim_t = 0.0
             tail = b'\x00\x00\x80\x7f'
@@ -257,6 +249,7 @@ class HighSpeedSerialWorker:
                 time.sleep(0.001)
             return
 
+        # 2. HARDWARE COM PORT MODE
         ser = None
         try:
             ser = serial.Serial()
@@ -291,16 +284,18 @@ class HighSpeedSerialWorker:
 
                     self.raw_bytes += len(chunk)
 
-                    if self.protocol == 'justfloat':
+                    # Universal Auto Protocol Detector & Decoder
+                    if self.protocol in ['auto', 'justfloat']:
                         self.byte_buf.extend(chunk)
 
-                        parsed_any = False
+                        # Step 1: Match 0x00 0x00 0x80 0x7F JustFloat tail
+                        parsed_justfloat = False
                         while True:
                             idx = self.byte_buf.find(tail)
                             if idx == -1:
                                 break
 
-                            parsed_any = True
+                            parsed_justfloat = True
                             raw_frame = self.byte_buf[:idx]
                             self.byte_buf = self.byte_buf[idx + 4:]
 
@@ -316,7 +311,36 @@ class HighSpeedSerialWorker:
                                 except Exception:
                                     pass
 
-                        if not parsed_any and len(self.byte_buf) >= 16:
+                        # Step 2: Text / FireWater Fallback
+                        if not parsed_justfloat and (b':' in self.byte_buf or b',' in self.byte_buf or b'\n' in self.byte_buf):
+                            try:
+                                text = self.byte_buf.decode('utf-8', errors='ignore')
+                                self.byte_buf.clear()
+
+                                for line in text.splitlines():
+                                    trimmed = line.strip()
+                                    if not trimmed: continue
+
+                                    floats_found = []
+                                    if ':' in trimmed:
+                                        for part in trimmed.split(','):
+                                            kv = part.split(':')
+                                            if len(kv) == 2:
+                                                try: floats_found.append(float(kv[1].strip()))
+                                                except ValueError: pass
+                                    else:
+                                        for p in trimmed.replace(',', ' ').split():
+                                            try: floats_found.append(float(p))
+                                            except ValueError: pass
+
+                                    if floats_found:
+                                        batch_channels.append(floats_found)
+                                        self.total_frames += 1
+                            except Exception:
+                                pass
+
+                        # Step 3: Raw Float32 Fallback
+                        elif not parsed_justfloat and len(self.byte_buf) >= 16:
                             rem = len(self.byte_buf) % 4
                             n_bytes = len(self.byte_buf) - rem
                             raw_slice = bytes(self.byte_buf[:n_bytes])
@@ -337,6 +361,7 @@ class HighSpeedSerialWorker:
                         if len(self.byte_buf) > 16384:
                             self.byte_buf.clear()
 
+                        # Flush batch into ring buffer
                         if len(batch_channels) >= 10 or (len(batch_channels) > 0 and ser.in_waiting == 0):
                             with self.plotter_ref.buffer_lock:
                                 buf_size = self.plotter_ref.buffer_size
@@ -351,7 +376,7 @@ class HighSpeedSerialWorker:
                                     self.plotter_ref.write_head += 1
                             batch_channels.clear()
 
-                    else:
+                    else: # Pure FireWater or Text Mode
                         try:
                             text = chunk.decode('utf-8', errors='ignore')
                         except Exception:
@@ -374,18 +399,12 @@ class HighSpeedSerialWorker:
                                 for part in trimmed.split(','):
                                     kv = part.split(':')
                                     if len(kv) == 2:
-                                        try:
-                                            v = float(kv[1].strip())
-                                            floats_found.append(v)
-                                        except ValueError:
-                                            pass
+                                        try: floats_found.append(float(kv[1].strip()))
+                                        except ValueError: pass
                             else:
                                 for p in trimmed.replace(',', ' ').split():
-                                    try:
-                                        v = float(p)
-                                        floats_found.append(v)
-                                    except ValueError:
-                                        pass
+                                    try: floats_found.append(float(p))
+                                    except ValueError: pass
 
                             if floats_found:
                                 with self.plotter_ref.buffer_lock:
@@ -410,13 +429,13 @@ class HighSpeedSerialWorker:
 
 
 # ==============================================================================
-# 3. Main Application Window (1:1 官方 VOFA+ 功能界面)
+# 3. Main Application Window
 # ==============================================================================
 class VofaDesktopApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("VOFA+ Native Desktop Ultimate | 伏特加上位机 (1:1 官方全功能版)")
+        self.setWindowTitle("VOFA+ Native Desktop Ultimate | 伏特加上位机 (全协议盲解 / 0闪烁版)")
         self.resize(1340, 850)
 
         self.worker = None
@@ -546,7 +565,7 @@ class VofaDesktopApp(QMainWindow):
 
         top_bar.addWidget(QLabel("协议:"))
         self.cb_proto = QComboBox()
-        self.cb_proto.addItems(["JustFloat (Raw Float32 + Tail)", "FireWater (text)", "Raw Text"])
+        self.cb_proto.addItems(["Auto (智能全协议盲解)", "JustFloat (Raw Float32 + Tail)", "FireWater (text)", "Raw Text"])
         top_bar.addWidget(self.cb_proto)
 
         self.btn_connect = QPushButton("⚡ 打开串口并连接")
@@ -577,10 +596,9 @@ class VofaDesktopApp(QMainWindow):
 
         layout.addLayout(top_bar)
 
-        # 2. MAIN CONTENT SPLITTER: Left Plotter + Right Data/Channel Panel
+        # 2. MAIN CONTENT SPLITTER
         splitter = QSplitter(Qt.Horizontal)
 
-        # Center Area: Plotter + Bottom Timebase Toolbar
         center_widget = QWidget()
         center_layout = QVBoxLayout(center_widget)
         center_layout.setContentsMargins(0, 0, 0, 0)
@@ -589,7 +607,7 @@ class VofaDesktopApp(QMainWindow):
         self.plotter = PyqtGraphVofaPlotter()
         center_layout.addWidget(self.plotter, stretch=1)
 
-        # Bottom Official VOFA+ Timebase Toolbar
+        # Bottom Toolbar
         tb_layout = QHBoxLayout()
         tb_layout.setSpacing(8)
 
@@ -645,7 +663,7 @@ class VofaDesktopApp(QMainWindow):
         center_layout.addLayout(hist_layout)
         splitter.addWidget(center_widget)
 
-        # Right Official VOFA+ Channel Control Sidebar
+        # Right Channel Tuning Sidebar
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -660,7 +678,6 @@ class VofaDesktopApp(QMainWindow):
         ch_lay.addWidget(self.table_channels)
         right_layout.addWidget(gb_channels)
 
-        # Channel Specific Detailed Tuning Panel
         gb_ch_tune = QGroupBox("⚙️ 通道偏置与增益调整")
         tune_lay = QGridLayout(gb_ch_tune)
 
@@ -720,7 +737,7 @@ class VofaDesktopApp(QMainWindow):
         splitter.setSizes([1070, 270])
         layout.addWidget(splitter, stretch=1)
 
-        # 3. BOTTOM DOCK: Serial Command Send Bar (串口指令发送栏)
+        # 3. BOTTOM DOCK
         cmd_box = QGroupBox("💬 串口指令发送 (Serial Command Sender)")
         cmd_lay = QHBoxLayout(cmd_box)
         cmd_lay.setContentsMargins(4, 4, 4, 4)
@@ -799,7 +816,7 @@ class VofaDesktopApp(QMainWindow):
             baud = 3000000
 
         proto_idx = self.cb_proto.currentIndex()
-        protos = ['justfloat', 'firewater', 'raw']
+        protos = ['auto', 'justfloat', 'firewater', 'raw']
 
         self.worker = HighSpeedSerialWorker(port_data, baud, protos[proto_idx])
         self.worker.start(self.plotter)
@@ -833,7 +850,7 @@ class VofaDesktopApp(QMainWindow):
             payload = (cmd_text + "\r\n").encode('utf-8')
         elif ending_idx == 2:
             payload = cmd_text.encode('utf-8')
-        else: # HEX Mode
+        else:
             try:
                 payload = bytes.fromhex(cmd_text.replace(' ', ''))
             except ValueError:
