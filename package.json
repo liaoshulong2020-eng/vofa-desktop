@@ -1,0 +1,25 @@
+{
+  "name": "vofa-plus-web",
+  "version": "1.0.0",
+  "description": "Web-based VOFA+ Serial Debugger & Data Visualization Platform (网页版伏特加上位机)",
+  "main": "index.html",
+  "scripts": {
+    "dev": "npx serve -l 3000 .",
+    "start": "npx serve -l 3000 ."
+  },
+  "keywords": [
+    "vofa+",
+    "serial",
+    "web-serial-api",
+    "oscilloscope",
+    "imu-3d",
+    "upper-computer",
+    "data-visualization"
+  ],
+  "author": "Antigravity",
+  "license": "MIT",
+  "dependencies": {
+    "serialport": "^13.0.0",
+    "ws": "^8.21.1"
+  }
+}

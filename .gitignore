@@ -1,0 +1,19 @@
+# Node modules
+node_modules/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# System and IDE
+.DS_Store
+.idea/
+.vscode/
+*.log

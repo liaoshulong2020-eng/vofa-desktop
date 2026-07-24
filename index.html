@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VOFA+ Web | 网页版伏特加上位机与串口可视化调试平台</title>
+  
+  <!-- Fonts & Icons -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  
+  <!-- External Libraries (Three.js for 3D IMU rendering) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  
+  <!-- Custom CSS -->
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="dark-theme">
+
+  <!-- Top App Bar -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="logo-icon">
+        <i class="fa-solid fa-wave-square"></i>
+      </div>
+      <div class="logo-text">
+        <span class="title">VOFA<span class="plus">+</span> <span class="tag">WEB</span></span>
+        <span class="subtitle">伏特加 Web 上位机 & 串口数据可视化调试系统</span>
+      </div>
+    </div>
+
+    <!-- Connection & Control Toolbar -->
+    <div class="header-controls">
+      <!-- Status Badge -->
+      <div class="status-indicator" id="statusIndicator">
+        <span class="status-dot disconnected"></span>
+        <span class="status-text" id="statusText">未连接</span>
+      </div>
+
+      <!-- Connection Type & Config -->
+      <div class="control-group">
+        <label><i class="fa-solid fa-plug"></i> 数据源</label>
+        <select id="sourceSelect">
+          <option value="simulator" selected>⚡ 内置多信号模拟器 (免硬件)</option>
+          <option value="serial">🔌 Web Serial API (真实硬件串口)</option>
+          <option value="websocket">🌐 WebSocket 网络数据流</option>
+        </select>
+      </div>
+
+      <!-- Quick Baud Rate Input -->
+      <div class="control-group" id="headerBaudGroup" style="display: flex;">
+        <label><i class="fa-solid fa-gauge"></i> 波特率</label>
+        <input type="text" id="headerBaudInput" value="3000000" placeholder="默认3M (3000000)" style="width: 105px;" class="input-text">
+      </div>
+
+      <!-- Protocol Decoder -->
+      <div class="control-group">
+        <label><i class="fa-solid fa-code"></i> 解析协议</label>
+        <select id="protocolSelect">
+          <option value="firewater" selected>FireWater (name:val1,val2...)</option>
+          <option value="justfloat">JustFloat (Raw Float32 + Tail)</option>
+          <option value="raw">Raw ASCII / HEX 纯文本</option>
+        </select>
+      </div>
+
+      <!-- Connect/Disconnect Toggle -->
+      <button class="btn btn-primary" id="btnConnect">
+        <i class="fa-solid fa-power-off"></i> <span id="connectBtnText">启动数据源</span>
+      </button>
+
+      <!-- Connection Settings Modal Trigger -->
+      <button class="btn btn-icon" id="btnOpenSettings" title="连接参数设置">
+        <i class="fa-solid fa-gear"></i>
+      </button>
+    </div>
+
+    <!-- Right Quick Actions -->
+    <div class="header-actions">
+      <button class="btn btn-outline" id="btnPause" title="暂停/继续波形采样">
+        <i class="fa-solid fa-pause"></i> <span>暂停</span>
+      </button>
+      <button class="btn btn-outline" id="btnClear" title="清空所有波形与日志">
+        <i class="fa-solid fa-trash-can"></i> <span>清空</span>
+      </button>
+      <button class="btn btn-outline" id="btnExport" title="导出数据 CSV/日志">
+        <i class="fa-solid fa-file-export"></i> <span>导出 CSV</span>
+      </button>
+
+      <!-- Layout View Selector -->
+      <div class="view-tabs">
+        <button class="tab-btn active" data-tab="oscilloscope"><i class="fa-solid fa-chart-line"></i> 示波器</button>
+        <button class="tab-btn" data-tab="imu"><i class="fa-solid fa-cube"></i> 3D姿态</button>
+        <button class="tab-btn" data-tab="gauges"><i class="fa-solid fa-gauge-high"></i> 仪表盘</button>
+        <button class="tab-btn" data-tab="fft"><i class="fa-solid fa-chart-simple"></i> 频谱分析</button>
+        <button class="tab-btn" data-tab="dashboard"><i class="fa-solid fa-table-cells-large"></i> 综合视图</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Workspace Layout -->
+  <main class="workspace">
+    <!-- Left Sidebar: Channel Manager & Controls -->
+    <aside class="sidebar-left" id="sidebarLeft">
+      <div class="sidebar-header">
+        <h3><i class="fa-solid fa-sliders"></i> 通道管理 (Channels)</h3>
+        <button class="btn-icon-small" id="btnAddChannel" title="添加新通道"><i class="fa-solid fa-plus"></i></button>
+      </div>
+      
+      <div class="channel-list" id="channelList">
+        <!-- Dynamic Channel Items Inserted via JS -->
+      </div>
+
+      <!-- Quick Data Statistics Overview -->
+      <div class="sidebar-section">
+        <h4><i class="fa-solid fa-microchip"></i> 采样率 & 状态</h4>
+        <div class="stats-card">
+          <div class="stat-item">
+            <span class="stat-label">刷新帧率:</span>
+            <span class="stat-value highlight" id="fpsCounter">60 FPS</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">数据接收率:</span>
+            <span class="stat-value" id="dataRateCounter">0 Pkt/s</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">总采样点数:</span>
+            <span class="stat-value" id="totalPointsCounter">0</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">数据包丢帧:</span>
+            <span class="stat-value text-success" id="lossCounter">0</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Simulator Signal Controls (When Simulator Mode Active) -->
+      <div class="sidebar-section" id="simConfigSection">
+        <h4><i class="fa-solid fa-wand-magic-sparkles"></i> 模拟信号参数控制</h4>
+        <div class="form-group">
+          <label>信号模式</label>
+          <select id="simPresetSelect">
+            <option value="standard">多路多波形 (正弦/三角/方波/噪声)</option>
+            <option value="pid">PID 闭环控制系统仿真 (阶跃响应)</option>
+            <option value="imu">3D 姿态陀螺仪数据流 (Roll/Pitch/Yaw)</option>
+            <option value="lorenz">洛伦兹混沌吸引子 (3D 迹线)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>基准频率: <span id="simFreqVal">1.0</span> Hz</label>
+          <input type="range" id="simFreqRange" min="0.1" max="10" step="0.1" value="1.0">
+        </div>
+        <div class="form-group">
+          <label>噪声强度: <span id="simNoiseVal">0.1</span></label>
+          <input type="range" id="simNoiseRange" min="0" max="1" step="0.05" value="0.1">
+        </div>
+      </div>
+    </aside>
+
+    <!-- Center Content Panels -->
+    <section class="content-area">
+      <!-- 1. Oscilloscope View -->
+      <div class="view-panel active" id="panel-oscilloscope">
+        <div class="panel-toolbar">
+          <div class="tool-group">
+            <button class="btn btn-small" id="btnZoomIn" title="放大时间轴"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+            <button class="btn btn-small" id="btnZoomOut" title="缩小时间轴"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+            <button class="btn btn-small" id="btnAutoFit" title="自动适应缩放"><i class="fa-solid fa-expand"></i></button>
+            <span class="divider"></span>
+            <button class="btn btn-small active" id="btnToggleGrid" title="切换网格"><i class="fa-solid fa-border-all"></i> 网格</button>
+            <button class="btn btn-small active" id="btnTogglePoints" title="切换采样点显示"><i class="fa-solid fa-circle-dot"></i> 数据点</button>
+            <button class="btn btn-small" id="btnToggleCursor" title="启用测量游标"><i class="fa-solid fa-crosshairs"></i> 游标测距</button>
+          </div>
+          <div class="tool-group">
+            <label class="checkbox-label"><input type="checkbox" id="chkAutoScroll" checked> 自动跟随</label>
+            <label>缓冲窗口:</label>
+            <select id="bufferSizeSelect">
+              <option value="500">500 点</option>
+              <option value="1000" selected>1000 点</option>
+              <option value="2000">2000 点</option>
+              <option value="5000">5000 点</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="canvas-container">
+          <canvas id="scopeCanvas"></canvas>
+          <!-- Hover Probe Overlay -->
+          <div class="cursor-tooltip" id="cursorTooltip"></div>
+        </div>
+
+        <!-- Channel Summary Bar -->
+        <div class="channel-summary-table" id="channelSummaryTable">
+          <!-- Dynamic Channel Stats -->
+        </div>
+      </div>
+
+      <!-- 2. 3D IMU Attitude View -->
+      <div class="view-panel" id="panel-imu">
+        <div class="imu-container">
+          <div class="imu-viewport" id="imu3dViewport">
+            <!-- Three.js Canvas appended here -->
+            <div class="imu-overlay">
+              <div class="imu-axis-legend">
+                <span class="axis-x">X: Roll</span>
+                <span class="axis-y">Y: Pitch</span>
+                <span class="axis-z">Z: Yaw</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Artificial Horizon Dials & Attitude Readouts -->
+          <div class="imu-hud">
+            <div class="hud-card">
+              <div class="hud-title">俯仰角 Pitch (X)</div>
+              <div class="hud-value neon-cyan" id="hudPitch">0.00°</div>
+              <div class="hud-bar"><div class="hud-fill" id="barPitch" style="width: 50%"></div></div>
+            </div>
+            <div class="hud-card">
+              <div class="hud-title">横滚角 Roll (Y)</div>
+              <div class="hud-value neon-purple" id="hudRoll">0.00°</div>
+              <div class="hud-bar"><div class="hud-fill" id="barRoll" style="width: 50%"></div></div>
+            </div>
+            <div class="hud-card">
+              <div class="hud-title">偏航角 Yaw (Z)</div>
+              <div class="hud-value neon-amber" id="hudYaw">0.00°</div>
+              <div class="hud-bar"><div class="hud-fill" id="barYaw" style="width: 50%"></div></div>
+            </div>
+            <div class="hud-card">
+              <div class="hud-title">3D 模型切换</div>
+              <select id="imuModelSelect" class="input-select">
+                <option value="board">⚡ 高科技 PCB 开发板</option>
+                <option value="drone">🚁 操纵战机/无人机</option>
+                <option value="cube">🧊 姿态测量立方体</option>
+              </select>
+              <button class="btn btn-outline btn-block mt-2" id="btnResetIMU"><i class="fa-solid fa-arrows-rotate"></i> 归零视角</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 3. Gauges View -->
+      <div class="view-panel" id="panel-gauges">
+        <div class="gauges-grid" id="gaugesGrid">
+          <!-- Dynamic Gauges Created via JS -->
+        </div>
+      </div>
+
+      <!-- 4. FFT Spectrum View -->
+      <div class="view-panel" id="panel-fft">
+        <div class="fft-container">
+          <div class="fft-header">
+            <h3><i class="fa-solid fa-chart-simple"></i> 实时快速傅里叶变换 (FFT 频谱分析仪)</h3>
+            <div class="form-group inline">
+              <label>目标通道:</label>
+              <select id="fftChannelSelect">
+                <!-- Populated by JS -->
+              </select>
+            </div>
+          </div>
+          <div class="fft-canvas-box">
+            <canvas id="fftCanvas"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5. Dashboard View (Combined Grid) -->
+      <div class="view-panel" id="panel-dashboard">
+        <div class="dashboard-grid">
+          <div class="dash-card card-scope">
+            <div class="card-header">
+              <span><i class="fa-solid fa-chart-line"></i> 动态示波器</span>
+            </div>
+            <div class="card-body">
+              <canvas id="miniScopeCanvas"></canvas>
+            </div>
+          </div>
+          <div class="dash-card card-imu">
+            <div class="card-header">
+              <span><i class="fa-solid fa-cube"></i> 3D 姿态图解</span>
+            </div>
+            <div class="card-body" id="miniImuViewport">
+            </div>
+          </div>
+          <div class="dash-card card-gauges">
+            <div class="card-header">
+              <span><i class="fa-solid fa-gauge-high"></i> 数显仪表</span>
+            </div>
+            <div class="card-body gauges-mini-flex" id="miniGaugesContainer">
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Bottom Dock: Serial Terminal & Control Console -->
+    <footer class="bottom-dock" id="bottomDock">
+      <div class="dock-header">
+        <div class="dock-tabs">
+          <button class="dock-tab-btn active" data-dock="terminal"><i class="fa-solid fa-terminal"></i> 数据终端与日志</button>
+          <button class="dock-tab-btn" data-dock="control"><i class="fa-solid fa-sliders"></i> 指令调参面板</button>
+        </div>
+        <div class="dock-actions">
+          <button class="btn-icon-small" id="btnToggleDock" title="展开/收起底栏"><i class="fa-solid fa-chevron-down"></i></button>
+        </div>
+      </div>
+
+      <div class="dock-content">
+        <!-- Terminal Panel -->
+        <div class="dock-panel active" id="dock-terminal">
+          <div class="terminal-toolbar">
+            <div class="tool-group">
+              <label class="checkbox-label"><input type="checkbox" id="chkTerminalHex"> HEX 显示</label>
+              <label class="checkbox-label"><input type="checkbox" id="chkShowTimestamp" checked> 显示时间戳</label>
+              <label class="checkbox-label"><input type="checkbox" id="chkAutoScrollTerm" checked> 自动滚动</label>
+            </div>
+            <div class="tool-group">
+              <input type="text" id="terminalFilter" placeholder="搜索过滤关键字..." class="input-search">
+              <button class="btn btn-small" id="btnClearTerminal"><i class="fa-solid fa-eraser"></i> 清屏</button>
+            </div>
+          </div>
+
+          <div class="terminal-body" id="terminalOutput">
+            <!-- Terminal Output Lines -->
+          </div>
+
+          <!-- Command Sender Box -->
+          <div class="command-sender-bar">
+            <select id="sendModeSelect">
+              <option value="string">ASCII 字符串</option>
+              <option value="hex">HEX 十六进制</option>
+            </select>
+            <select id="lineEndingSelect">
+              <option value="none">无换行</option>
+              <option value="rn" selected>\r\n (CRLF)</option>
+              <option value="n">\n (LF)</option>
+            </select>
+            <input type="text" id="cmdInput" placeholder="输入要发送的数据指令 (例如: PID_KP:1.5 或 01 03 00 00 00 02)..." class="input-cmd">
+            <button class="btn btn-primary" id="btnSendCmd"><i class="fa-solid fa-paper-plane"></i> 发送</button>
+
+            <!-- Auto Repeat Send -->
+            <label class="checkbox-label ml-2"><input type="checkbox" id="chkAutoSend"> 自动重发</label>
+            <input type="number" id="autoSendInterval" value="1000" min="100" max="60000" style="width: 70px;" class="input-num"> ms
+          </div>
+        </div>
+
+        <!-- Control Console Panel -->
+        <div class="dock-panel" id="dock-control">
+          <div class="control-grid">
+            <div class="control-card">
+              <h4>快捷指令宏按钮</h4>
+              <div class="macro-buttons-grid">
+                <button class="btn btn-macro" data-cmd="START\r\n"><i class="fa-solid fa-play"></i> 系统启动 (START)</button>
+                <button class="btn btn-macro" data-cmd="STOP\r\n"><i class="fa-solid fa-stop"></i> 系统急停 (STOP)</button>
+                <button class="btn btn-macro" data-cmd="RESET\r\n"><i class="fa-solid fa-rotate-left"></i> 参数复位 (RESET)</button>
+                <button class="btn btn-macro" data-cmd="CALIB_IMU\r\n"><i class="fa-solid fa-compass"></i> IMU 校准</button>
+              </div>
+            </div>
+
+            <div class="control-card">
+              <h4>PID 参数实时滑动微调</h4>
+              <div class="slider-control-group">
+                <label>比例系数 Kp: <span id="valKp">1.50</span></label>
+                <input type="range" class="cmd-slider" data-prefix="SET_KP:" min="0" max="10" step="0.05" value="1.50">
+              </div>
+              <div class="slider-control-group">
+                <label>积分系数 Ki: <span id="valKi">0.20</span></label>
+                <input type="range" class="cmd-slider" data-prefix="SET_KI:" min="0" max="5" step="0.01" value="0.20">
+              </div>
+              <div class="slider-control-group">
+                <label>微分系数 Kd: <span id="valKd">0.05</span></label>
+                <input type="range" class="cmd-slider" data-prefix="SET_KD:" min="0" max="2" step="0.01" value="0.05">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- Settings Modal (Web Serial & Connection Configuration) -->
+  <div class="modal-overlay" id="settingsModal">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3><i class="fa-solid fa-sliders"></i> 通信与波特率设置</h3>
+        <button class="btn-close" id="btnCloseModal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Baud Rate Custom Input -->
+        <div class="form-group">
+          <label>自定义波特率 (Baud Rate, 支持直接输入数字或 3M / 1.5M / 115200)</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="baudRateInput" value="3000000" class="input-text" style="flex:1;" placeholder="例如: 3000000 或 3M">
+            <select id="baudPresetSelect" style="width: 130px;">
+              <option value="3000000" selected>⚡ 3M (3000000)</option>
+              <option value="1500000">1.5M (1500000)</option>
+              <option value="921600">921600</option>
+              <option value="460800">460800</option>
+              <option value="115200">115200</option>
+              <option value="9600">9600</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>数据位 (Data Bits)</label>
+          <select id="dataBitsSelect"><option value="8">8 Bits</option><option value="7">7 Bits</option></select>
+        </div>
+        <div class="form-group">
+          <label>停止位 (Stop Bits)</label>
+          <select id="stopBitsSelect"><option value="1">1 Bit</option><option value="2">2 Bits</option></select>
+        </div>
+        <div class="form-group">
+          <label>奇偶校验 (Parity)</label>
+          <select id="paritySelect"><option value="none">None (无校验)</option><option value="even">Even (偶校验)</option><option value="odd">Odd (奇校验)</option></select>
+        </div>
+
+        <!-- COM Port Guide Card -->
+        <div class="com-help-card" style="background: rgba(0, 243, 255, 0.08); border: 1px solid var(--neon-cyan); border-radius: 6px; padding: 10px; margin-top: 6px;">
+          <h4 style="color: var(--neon-cyan); font-size: 12px; margin-bottom: 4px; display: flex; align-items: center; gap: 6px;">
+            <i class="fa-solid fa-circle-info"></i> 如何选择 COM 串口设备？
+          </h4>
+          <p style="font-size: 11px; color: var(--text-muted); line-height: 1.5;">
+            当数据源选择为“<b>Web Serial API (真实硬件串口)</b>”并点击“<b>选择 COM 口并连接</b>”时，Chrome 或 Edge 浏览器顶部会自动弹出原生 COM 端口选择卡片。直接在弹窗中选中您的 USB 转串口设备（如 COM3, COM5, CH340, CP2102）并点击“连接”即可。
+          </p>
+        </div>
+
+        <hr class="divider">
+        <div class="form-group">
+          <label>WebSocket 节点地址</label>
+          <input type="text" id="wsUrlInput" value="ws://localhost:8080" class="input-text">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" id="btnSaveSettings">保存并应用</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- JavaScript Modules -->
+  <script src="js/protocol.js"></script>
+  <script src="js/simulator.js"></script>
+  <script src="js/serial.js"></script>
+  <script src="js/oscilloscope.js"></script>
+  <script src="js/imu3d.js"></script>
+  <script src="js/fft.js"></script>
+  <script src="js/gauges.js"></script>
+  <script src="js/terminal.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
