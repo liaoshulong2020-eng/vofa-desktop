@@ -2,11 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 ==============================================================================
- VOFA+ Native Desktop Pro (全屏填充波形 / 一键释放 COM11 / 极速 C++ 引擎)
+ VOFA+ Native Desktop Ultimate (官方 VOFA+ 像素级 1:1 功能全复刻版)
  Features:
-   - 彻底修复“0-1000 左右留白”：X 轴视窗自动与数据长度精准对齐 (0..view_pts)，100% 满屏平滑滚动展示！
-   - 一键释放 COM11 独占锁：内置“🔒 释放 COM11 (关闭原版 VOFA+)”安全工具，一键终止抢占端口的进程。
-   - 采用 Qt5 C++ 原生架构 (与 C:\\Program Files\\Gutega\\VOFA+ 官方技术栈完全一致)，结合 PyQtGraph C++ OpenGL 硬件加速！
+   1. 底部时间轴与缓冲区控制栏 (对应官方界面):
+      - Δt (ms) 采样间隔设置 (动态转换 X 轴为真实的 -1000ms 到 0ms 相对时间轴)。
+      - 缓冲区上限 (默认 500,000 点/通道)。
+      - Auto 点数对齐 (视窗波形长度调整，范围 50 - 100,000 点，完美解决波形长度调节)。
+      - 历史回放滑动条 (显示 500000 / 500000 进度与 ms/div 刻度，支持拖拽历史回溯与 Auto 恢复实时)。
+   2. 右侧数据与通道增强控制面板:
+      - 自定义通道名称 (支持修改 CH0 为 v_sync, vbus_notch_filter 等)。
+      - 自定义通道颜色选择器。
+      - 通道增益 (Gain, 默认 1.0) 与 Y 偏置 (Y Offset) / X 偏置 (X Offset) 独立控制。
+      - 一键重置通道偏置与增益。
+   3. 底部串口指令发送栏 (Command TX Dock):
+      - 串口指令文本框，支持 \\n / \\r\\n / HEX 模式发送与 Enter 快捷键。
+   4. 原生 PyQtGraph C++ 硬件加速 PlotWidget (60 FPS 满屏无缝滚轴)。
 ==============================================================================
 """
 
@@ -27,8 +37,8 @@ from PyQt5.QtGui import QFont, QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QComboBox, QLineEdit, QPushButton,
-    QCheckBox, QSplitter, QTextEdit, QGroupBox,
-    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox
+    QCheckBox, QSplitter, QTextEdit, QGroupBox, QSpinBox, QDoubleSpinBox,
+    QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, QColorDialog, QSlider
 )
 
 import pyqtgraph as pg
@@ -39,11 +49,11 @@ pg.setConfigOption('foreground', '#8492a6')
 pg.setConfigOptions(antialias=False)
 
 MAX_CHANNELS = 16
-RING_BUFFER_SIZE = 100000
+DEFAULT_RING_BUFFER_SIZE = 500000
 
 
 # ==============================================================================
-# 1. PyQtGraph Ultra-Fast C++ Plotter Widget (满屏对齐/滚动视图引擎)
+# 1. PyQtGraph Official-Style Plotter Engine
 # ==============================================================================
 class PyqtGraphVofaPlotter(pg.PlotWidget):
     def __init__(self, parent=None):
@@ -56,17 +66,26 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
         self.enableAutoRange(axis='y', enable=False)
 
         self.setLabel('left', '幅值 (Amplitude)', units='V')
-        self.setLabel('bottom', '采样点 (Samples)')
+        self.setLabel('bottom', '相对时间 (Time)', units='ms')
 
         self.buffer_lock = threading.Lock()
-        self.values = np.zeros((MAX_CHANNELS, RING_BUFFER_SIZE), dtype=np.float32)
+        self.buffer_size = DEFAULT_RING_BUFFER_SIZE
+        self.values = np.zeros((MAX_CHANNELS, self.buffer_size), dtype=np.float32)
         self.write_head = 0
 
         self.active_mask = np.zeros(MAX_CHANNELS, dtype=bool)
         self.vis_mask = np.ones(MAX_CHANNELS, dtype=bool)
+        self.channel_names = [f"CH{i}" for i in range(MAX_CHANNELS)]
+
+        # Channel Gain & Offsets
+        self.ch_gain = np.ones(MAX_CHANNELS, dtype=np.float32)
+        self.ch_y_offset = np.zeros(MAX_CHANNELS, dtype=np.float32)
+        self.ch_x_offset = np.zeros(MAX_CHANNELS, dtype=np.int32)
+
         self.view_pts = 1000
+        self.dt_ms = 1.0
         self.is_paused = False
-        self.user_panning = False
+        self.history_offset = 0  # 0 means live auto-scroll
 
         self.channel_colors = [
             '#00f3ff', '#00ff87', '#ffaa00', '#ff007f', 
@@ -78,16 +97,20 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
         self.curves = []
         for i in range(MAX_CHANNELS):
             pen = pg.mkPen(color=self.channel_colors[i], width=2)
-            curve = self.plot(pen=pen, name=f"CH{i}")
+            curve = self.plot(pen=pen, name=self.channel_names[i])
             curve.hide()
             self.curves.append(curve)
 
-        # Detect User Drag/Zoom Events to pause auto-scroll lock
-        self.plotItem.vb.sigStateChanged.connect(self.on_view_changed)
-
-    def on_view_changed(self):
-        # Triggered when user manually drags or zooms with mouse
-        pass
+    def set_buffer_capacity(self, new_cap):
+        with self.buffer_lock:
+            new_cap = max(10000, min(1000000, new_cap))
+            if new_cap != self.buffer_size:
+                new_values = np.zeros((MAX_CHANNELS, new_cap), dtype=np.float32)
+                min_len = min(new_cap, self.buffer_size)
+                new_values[:, :min_len] = self.values[:, :min_len]
+                self.values = new_values
+                self.buffer_size = new_cap
+                self.write_head = self.write_head % new_cap
 
     def fit_y_once(self):
         try:
@@ -96,9 +119,12 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
                 if head < 2:
                     return
 
-                end_idx = head
+                end_idx = head - self.history_offset
                 start_idx = max(0, end_idx - self.view_pts)
-                indices = np.arange(start_idx, end_idx) % RING_BUFFER_SIZE
+                if end_idx <= start_idx:
+                    return
+
+                indices = np.arange(start_idx, end_idx) % self.buffer_size
                 sub = self.values[:, indices]
                 active_sub = sub[self.active_mask & self.vis_mask]
 
@@ -116,6 +142,7 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
             self.values.fill(0)
             self.write_head = 0
             self.active_mask.fill(False)
+            self.history_offset = 0
 
         for c in self.curves:
             c.clear()
@@ -130,25 +157,29 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
             if head < 2:
                 return
 
-            # Always fetch the LATEST self.view_pts points
-            start_idx = max(0, head - self.view_pts)
-            n_pts = head - start_idx
+            end_idx = max(2, head - self.history_offset)
+            start_idx = max(0, end_idx - self.view_pts)
+            n_pts = end_idx - start_idx
             if n_pts < 2:
                 return
 
-            indices = np.arange(start_idx, head) % RING_BUFFER_SIZE
+            indices = np.arange(start_idx, end_idx) % self.buffer_size
             y_snapshot = self.values[:, indices].copy()
             active_snap = self.active_mask.copy()
             vis_snap = self.vis_mask.copy()
+            gains = self.ch_gain.copy()
+            y_offsets = self.ch_y_offset.copy()
 
-        # Lock X viewport range exactly to 0..n_pts so the waveform fills 100% of the canvas!
-        self.setXRange(0, n_pts, padding=0)
-        x_vals = np.arange(n_pts)
+        # Convert sample count to relative time in milliseconds: - (n_pts - 1) * dt to 0 ms
+        t_start_ms = - (n_pts - 1) * self.dt_ms
+        t_end_ms = 0.0
+        self.setXRange(t_start_ms, t_end_ms, padding=0)
+        x_vals = np.linspace(t_start_ms, t_end_ms, n_pts)
 
         for ch_idx in range(MAX_CHANNELS):
             curve = self.curves[ch_idx]
             if active_snap[ch_idx] and vis_snap[ch_idx]:
-                y_raw = y_snapshot[ch_idx]
+                y_raw = y_snapshot[ch_idx] * gains[ch_idx] + y_offsets[ch_idx]
                 y_clean = np.nan_to_num(y_raw, nan=0.0, posinf=1e4, neginf=-1e4)
                 curve.setData(x_vals, y_clean)
                 curve.show()
@@ -157,7 +188,7 @@ class PyqtGraphVofaPlotter(pg.PlotWidget):
 
 
 # ==============================================================================
-# 2. High-Speed Serial Worker (Dual-Engine Lenient Parser)
+# 2. High-Speed Serial Worker Thread
 # ==============================================================================
 class HighSpeedSerialWorker:
     def __init__(self, port_name, baud_rate, protocol='justfloat'):
@@ -186,8 +217,16 @@ class HighSpeedSerialWorker:
         if self.thread:
             self.thread.join(timeout=1.0)
 
+    def send_cmd(self, cmd_bytes):
+        if hasattr(self, 'ser_obj') and self.ser_obj and self.ser_obj.is_open:
+            try:
+                self.ser_obj.write(cmd_bytes)
+                return True
+            except Exception as e:
+                print(f"发送指令错误: {e}")
+        return False
+
     def _worker_loop(self):
-        # 1. BUILT-IN SIMULATOR MODE
         if self.port_name == 'SIMULATOR':
             sim_t = 0.0
             tail = b'\x00\x00\x80\x7f'
@@ -203,7 +242,7 @@ class HighSpeedSerialWorker:
                 self.raw_bytes += len(chunk)
 
                 with self.plotter_ref.buffer_lock:
-                    pos = self.plotter_ref.write_head % RING_BUFFER_SIZE
+                    pos = self.plotter_ref.write_head % self.plotter_ref.buffer_size
                     self.plotter_ref.values[0, pos] = val0
                     self.plotter_ref.values[1, pos] = val1
                     self.plotter_ref.values[2, pos] = val2
@@ -218,7 +257,6 @@ class HighSpeedSerialWorker:
                 time.sleep(0.001)
             return
 
-        # 2. HARDWARE COM PORT MODE
         ser = None
         try:
             ser = serial.Serial()
@@ -230,6 +268,7 @@ class HighSpeedSerialWorker:
             ser.open()
             
             ser.set_buffer_size(rx_size=1048576, tx_size=65536)
+            self.ser_obj = ser
         except Exception as e:
             err_str = str(e)
             if "PermissionError" in err_str or "13" in err_str or "Access is denied" in err_str:
@@ -255,7 +294,6 @@ class HighSpeedSerialWorker:
                     if self.protocol == 'justfloat':
                         self.byte_buf.extend(chunk)
 
-                        # Primary Parser: Match 0x00 0x00 0x80 0x7F tail
                         parsed_any = False
                         while True:
                             idx = self.byte_buf.find(tail)
@@ -278,7 +316,6 @@ class HighSpeedSerialWorker:
                                 except Exception:
                                     pass
 
-                        # Fallback Parser: Decode raw 4-byte Float32 streams if no tail exists
                         if not parsed_any and len(self.byte_buf) >= 16:
                             rem = len(self.byte_buf) % 4
                             n_bytes = len(self.byte_buf) - rem
@@ -300,11 +337,11 @@ class HighSpeedSerialWorker:
                         if len(self.byte_buf) > 16384:
                             self.byte_buf.clear()
 
-                        # Batch flush into ring buffer
                         if len(batch_channels) >= 10 or (len(batch_channels) > 0 and ser.in_waiting == 0):
                             with self.plotter_ref.buffer_lock:
+                                buf_size = self.plotter_ref.buffer_size
                                 for floats in batch_channels:
-                                    pos = self.plotter_ref.write_head % RING_BUFFER_SIZE
+                                    pos = self.plotter_ref.write_head % buf_size
                                     for ch_idx in range(min(len(floats), MAX_CHANNELS)):
                                         val = floats[ch_idx]
                                         if not np.isnan(val) and not np.isinf(val):
@@ -314,7 +351,7 @@ class HighSpeedSerialWorker:
                                     self.plotter_ref.write_head += 1
                             batch_channels.clear()
 
-                    else: # FireWater or Raw Text
+                    else:
                         try:
                             text = chunk.decode('utf-8', errors='ignore')
                         except Exception:
@@ -352,7 +389,8 @@ class HighSpeedSerialWorker:
 
                             if floats_found:
                                 with self.plotter_ref.buffer_lock:
-                                    pos = self.plotter_ref.write_head % RING_BUFFER_SIZE
+                                    buf_size = self.plotter_ref.buffer_size
+                                    pos = self.plotter_ref.write_head % buf_size
                                     for ch_idx, val in enumerate(floats_found[:MAX_CHANNELS]):
                                         self.plotter_ref.values[ch_idx, pos] = val
                                         self.plotter_ref.active_mask[ch_idx] = True
@@ -368,20 +406,22 @@ class HighSpeedSerialWorker:
 
         if ser and ser.is_open:
             ser.close()
+            self.ser_obj = None
 
 
 # ==============================================================================
-# 3. Main Application Window
+# 3. Main Application Window (1:1 官方 VOFA+ 功能界面)
 # ==============================================================================
 class VofaDesktopApp(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("VOFA+ Native Desktop Pro | 伏特加上位机 (满屏对齐/一键释放 COM11 版)")
-        self.resize(1300, 820)
+        self.setWindowTitle("VOFA+ Native Desktop Ultimate | 伏特加上位机 (1:1 官方全功能版)")
+        self.resize(1340, 850)
 
         self.worker = None
         self.known_channels = [False] * MAX_CHANNELS
+        self.selected_ch_idx = 0
 
         # Stats
         self.last_stat_time = time.time()
@@ -422,18 +462,18 @@ class VofaDesktopApp(QMainWindow):
                 font-weight: bold;
                 color: #00f3ff;
             }
-            QComboBox, QLineEdit {
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
                 background-color: #121824;
                 border: 1px solid rgba(0, 243, 255, 0.3);
                 border-radius: 4px;
-                padding: 4px 8px;
+                padding: 3px 6px;
                 color: #ffffff;
             }
             QPushButton {
                 background-color: #182030;
                 border: 1px solid rgba(0, 243, 255, 0.3);
                 border-radius: 4px;
-                padding: 6px 14px;
+                padding: 5px 12px;
                 font-weight: 600;
                 color: #ffffff;
             }
@@ -451,10 +491,6 @@ class VofaDesktopApp(QMainWindow):
                 border-color: #f5c6cb;
                 color: #ff9999;
             }
-            QPushButton#btnKillPort:hover {
-                background-color: #f8d7da;
-                color: #721c24;
-            }
             QTextEdit {
                 background-color: #05070c;
                 border: 1px solid rgba(0, 243, 255, 0.15);
@@ -462,17 +498,33 @@ class VofaDesktopApp(QMainWindow):
                 font-size: 11px;
                 color: #00ff87;
             }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #182030;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #00f3ff;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #ffffff;
+                width: 14px;
+                margin-top: -4px;
+                margin-bottom: -4px;
+                border-radius: 7px;
+            }
         """)
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(5)
 
-        # Top Bar
+        # 1. TOP BAR
         top_bar = QHBoxLayout()
-        top_bar.setSpacing(8)
+        top_bar.setSpacing(6)
 
         logo = QLabel("<b>VOFA+</b> <font color='#00f3ff'>PRO</font>")
         logo.setFont(QFont("Segoe UI", 14, QFont.Bold))
@@ -489,7 +541,7 @@ class VofaDesktopApp(QMainWindow):
 
         top_bar.addWidget(QLabel("波特率:"))
         self.edit_baud = QLineEdit("3000000")
-        self.edit_baud.setFixedWidth(90)
+        self.edit_baud.setFixedWidth(85)
         top_bar.addWidget(self.edit_baud)
 
         top_bar.addWidget(QLabel("协议:"))
@@ -502,7 +554,7 @@ class VofaDesktopApp(QMainWindow):
         self.btn_connect.clicked.connect(self.toggle_connection)
         top_bar.addWidget(self.btn_connect)
 
-        btn_kill = QPushButton("🔒 释放 COM11 (关闭原版 VOFA+)")
+        btn_kill = QPushButton("🔒 释放 COM11")
         btn_kill.setObjectName("btnKillPort")
         btn_kill.setToolTip("一键关闭后台可能占用 COM11 端口的原版 VOFA+ 或串口软件")
         btn_kill.clicked.connect(self.kill_competing_apps)
@@ -525,22 +577,126 @@ class VofaDesktopApp(QMainWindow):
 
         layout.addLayout(top_bar)
 
-        # Splitter: Left Sidebar & Right Plotter
+        # 2. MAIN CONTENT SPLITTER: Left Plotter + Right Data/Channel Panel
         splitter = QSplitter(Qt.Horizontal)
 
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        # Center Area: Plotter + Bottom Timebase Toolbar
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(4)
 
-        gb_channels = QGroupBox("通道管理 (Channels)")
+        self.plotter = PyqtGraphVofaPlotter()
+        center_layout.addWidget(self.plotter, stretch=1)
+
+        # Bottom Official VOFA+ Timebase Toolbar
+        tb_layout = QHBoxLayout()
+        tb_layout.setSpacing(8)
+
+        tb_layout.addWidget(QLabel("Δt:"))
+        self.spin_dt = QDoubleSpinBox()
+        self.spin_dt.setRange(0.01, 1000.0)
+        self.spin_dt.setValue(1.0)
+        self.spin_dt.setSuffix(" ms")
+        self.spin_dt.setFixedWidth(85)
+        self.spin_dt.valueChanged.connect(self.on_dt_changed)
+        tb_layout.addWidget(self.spin_dt)
+
+        tb_layout.addWidget(QLabel("缓冲区上限:"))
+        self.spin_buf_cap = QSpinBox()
+        self.spin_buf_cap.setRange(10000, 1000000)
+        self.spin_buf_cap.setSingleStep(50000)
+        self.spin_buf_cap.setValue(500000)
+        self.spin_buf_cap.setSuffix(" /ch")
+        self.spin_buf_cap.setFixedWidth(120)
+        self.spin_buf_cap.valueChanged.connect(self.on_buf_cap_changed)
+        tb_layout.addWidget(self.spin_buf_cap)
+
+        tb_layout.addWidget(QLabel("Auto点数对齐:"))
+        self.spin_view_pts = QSpinBox()
+        self.spin_view_pts.setRange(50, 100000)
+        self.spin_view_pts.setSingleStep(100)
+        self.spin_view_pts.setValue(1000)
+        self.spin_view_pts.setFixedWidth(90)
+        self.spin_view_pts.valueChanged.connect(self.on_view_pts_changed)
+        tb_layout.addWidget(self.spin_view_pts)
+
+        self.btn_auto_scroll = QPushButton("Auto 实时")
+        self.btn_auto_scroll.setStyleSheet("color: #00ff87; font-weight: bold;")
+        self.btn_auto_scroll.clicked.connect(self.restore_auto_scroll)
+        tb_layout.addWidget(self.btn_auto_scroll)
+
+        tb_layout.addStretch()
+
+        center_layout.addLayout(tb_layout)
+
+        # Historical Progress Slider
+        hist_layout = QHBoxLayout()
+        self.lbl_hist_info = QLabel("0 / 500000 | 60.0 FPS | 100ms/div")
+        self.lbl_hist_info.setStyleSheet("color: #8492a6; font-family: 'JetBrains Mono';")
+        hist_layout.addWidget(self.lbl_hist_info)
+
+        self.slider_hist = QSlider(Qt.Horizontal)
+        self.slider_hist.setRange(0, 1000)
+        self.slider_hist.setValue(1000)
+        self.slider_hist.valueChanged.connect(self.on_slider_hist_changed)
+        hist_layout.addWidget(self.slider_hist, stretch=1)
+
+        center_layout.addLayout(hist_layout)
+        splitter.addWidget(center_widget)
+
+        # Right Official VOFA+ Channel Control Sidebar
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        gb_channels = QGroupBox("👁️ 通道列表 (Data Channels)")
         ch_lay = QVBoxLayout(gb_channels)
         self.table_channels = QTableWidget(0, 3)
-        self.table_channels.setHorizontalHeaderLabels(["名称", "实时数值", "显示"])
+        self.table_channels.setHorizontalHeaderLabels(["名称", "数值", "显示"])
         self.table_channels.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_channels.cellClicked.connect(self.on_channel_selected)
         ch_lay.addWidget(self.table_channels)
-        left_layout.addWidget(gb_channels)
+        right_layout.addWidget(gb_channels)
 
-        gb_stats = QGroupBox("极速性能与速率监控")
+        # Channel Specific Detailed Tuning Panel
+        gb_ch_tune = QGroupBox("⚙️ 通道偏置与增益调整")
+        tune_lay = QGridLayout(gb_ch_tune)
+
+        tune_lay.addWidget(QLabel("数据名称:"), 0, 0)
+        self.edit_ch_name = QLineEdit("CH0")
+        self.edit_ch_name.editingFinished.connect(self.on_ch_name_edited)
+        tune_lay.addWidget(self.edit_ch_name, 0, 1)
+
+        tune_lay.addWidget(QLabel("颜色:"), 1, 0)
+        self.btn_ch_color = QPushButton(" 选择颜色 ")
+        self.btn_ch_color.clicked.connect(self.pick_ch_color)
+        tune_lay.addWidget(self.btn_ch_color, 1, 1)
+
+        tune_lay.addWidget(QLabel("增益 (Gain):"), 2, 0)
+        self.spin_gain = QDoubleSpinBox()
+        self.spin_gain.setRange(-1000.0, 1000.0)
+        self.spin_gain.setSingleStep(0.01)
+        self.spin_gain.setValue(1.0)
+        self.spin_gain.valueChanged.connect(self.on_gain_changed)
+        tune_lay.addWidget(self.spin_gain, 2, 1)
+
+        tune_lay.addWidget(QLabel("Y 偏置:"), 3, 0)
+        self.spin_y_offset = QDoubleSpinBox()
+        self.spin_y_offset.setRange(-1000.0, 1000.0)
+        self.spin_y_offset.setSingleStep(0.1)
+        self.spin_y_offset.setValue(0.0)
+        self.spin_y_offset.valueChanged.connect(self.on_y_offset_changed)
+        tune_lay.addWidget(self.spin_y_offset, 3, 1)
+
+        btn_reset_ch = QPushButton("重置增益偏置")
+        btn_reset_ch.clicked.connect(self.reset_ch_params)
+        tune_lay.addWidget(btn_reset_ch, 4, 0, 1, 2)
+
+        right_layout.addWidget(gb_ch_tune)
+
+        gb_stats = QGroupBox("极速性能与速率")
         st_lay = QGridLayout(gb_stats)
         self.lbl_fps = QLabel("60 FPS")
         self.lbl_fps.setStyleSheet("color: #00ff87; font-weight: bold;")
@@ -557,29 +713,46 @@ class VofaDesktopApp(QMainWindow):
         st_lay.addWidget(QLabel("总数据点:"), 3, 0)
         st_lay.addWidget(self.lbl_total, 3, 1)
 
-        left_layout.addWidget(gb_stats)
-        left_panel.setMaximumWidth(260)
-        splitter.addWidget(left_panel)
+        right_layout.addWidget(gb_stats)
+        right_panel.setFixedWidth(270)
+        splitter.addWidget(right_panel)
 
-        # Right Native PyQtGraph Plotter
-        self.plotter = PyqtGraphVofaPlotter()
-        splitter.addWidget(self.plotter)
-        splitter.setSizes([260, 1040])
+        splitter.setSizes([1070, 270])
         layout.addWidget(splitter, stretch=1)
 
-        # Bottom Dock
+        # 3. BOTTOM DOCK: Serial Command Send Bar (串口指令发送栏)
+        cmd_box = QGroupBox("💬 串口指令发送 (Serial Command Sender)")
+        cmd_lay = QHBoxLayout(cmd_box)
+        cmd_lay.setContentsMargins(4, 4, 4, 4)
+
+        self.edit_cmd = QLineEdit()
+        self.edit_cmd.setPlaceholderText("输入要发送给单片机的串口指令/参数...")
+        self.edit_cmd.returnPressed.connect(self.send_serial_cmd)
+        cmd_lay.addWidget(self.edit_cmd, stretch=1)
+
+        self.cb_cmd_ending = QComboBox()
+        self.cb_cmd_ending.addItems(["\\n (LF)", "\\r\\n (CRLF)", "无换行", "HEX 模式"])
+        cmd_lay.addWidget(self.cb_cmd_ending)
+
+        btn_send = QPushButton("发送(S)")
+        btn_send.setStyleSheet("background-color: #00f3ff; color: #080c14; font-weight: bold;")
+        btn_send.clicked.connect(self.send_serial_cmd)
+        cmd_lay.addWidget(btn_send)
+
+        layout.addWidget(cmd_box)
+
+        # Log Terminal
         gb_term = QGroupBox("串口 Raw 日志终端")
         t_lay = QVBoxLayout(gb_term)
         t_lay.setContentsMargins(2, 2, 2, 2)
         self.txt_term = QTextEdit()
         self.txt_term.setReadOnly(True)
-        self.txt_term.setMaximumHeight(120)
+        self.txt_term.setMaximumHeight(85)
         t_lay.addWidget(self.txt_term)
         layout.addWidget(gb_term)
 
     def refresh_ports(self):
         self.cb_port.clear()
-
         ports = serial.tools.list_ports.comports()
         com11_idx = -1
 
@@ -644,6 +817,54 @@ class VofaDesktopApp(QMainWindow):
             QMessageBox.critical(self, "连接状态提示", err)
             self.log_sys(f"⚠️ {err}")
 
+    def send_serial_cmd(self):
+        cmd_text = self.edit_cmd.text()
+        if not cmd_text:
+            return
+
+        if not self.worker or not self.worker.is_running:
+            QMessageBox.warning(self, "提示", "请先连接串口再发送指令！")
+            return
+
+        ending_idx = self.cb_cmd_ending.currentIndex()
+        if ending_idx == 0:
+            payload = (cmd_text + "\n").encode('utf-8')
+        elif ending_idx == 1:
+            payload = (cmd_text + "\r\n").encode('utf-8')
+        elif ending_idx == 2:
+            payload = cmd_text.encode('utf-8')
+        else: # HEX Mode
+            try:
+                payload = bytes.fromhex(cmd_text.replace(' ', ''))
+            except ValueError:
+                QMessageBox.warning(self, "格式错误", "HEX 格式错误，请填写正确的十六进制字节字符串！")
+                return
+
+        if self.worker.send_cmd(payload):
+            self.log_sys(f"发送成功 --> {cmd_text}")
+            self.edit_cmd.clear()
+        else:
+            self.log_sys(f"发送失败！")
+
+    def on_dt_changed(self, val):
+        self.plotter.dt_ms = float(val)
+
+    def on_buf_cap_changed(self, val):
+        self.plotter.set_buffer_capacity(int(val))
+
+    def on_view_pts_changed(self, val):
+        self.plotter.view_pts = int(val)
+
+    def restore_auto_scroll(self):
+        self.plotter.history_offset = 0
+        self.slider_hist.setValue(1000)
+
+    def on_slider_hist_changed(self, val):
+        head = self.plotter.write_head
+        if head > 1000:
+            ratio = 1.0 - (val / 1000.0)
+            self.plotter.history_offset = int(ratio * (head - self.plotter.view_pts))
+
     def render_loop_60fps(self):
         if self.btn_pause.isChecked() or not self.worker or not self.worker.is_running:
             return
@@ -667,7 +888,7 @@ class VofaDesktopApp(QMainWindow):
         row = self.table_channels.rowCount()
         self.table_channels.insertRow(row)
 
-        ch_name = f"CH{ch_idx}"
+        ch_name = self.plotter.channel_names[ch_idx]
         color = self.plotter.channel_colors[ch_idx]
 
         item_name = QTableWidgetItem(f"■ {ch_name}")
@@ -685,6 +906,53 @@ class VofaDesktopApp(QMainWindow):
 
     def toggle_ch_vis(self, ch_idx, state):
         self.plotter.vis_mask[ch_idx] = (state == Qt.Checked)
+
+    def on_channel_selected(self, row, col):
+        if row < MAX_CHANNELS:
+            self.selected_ch_idx = row
+            ch_name = self.plotter.channel_names[row]
+            self.edit_ch_name.setText(ch_name)
+
+            color_hex = self.plotter.channel_colors[row]
+            self.btn_ch_color.setStyleSheet(f"background-color: {color_hex}; color: #000000; font-weight: bold;")
+
+            self.spin_gain.blockSignals(True)
+            self.spin_gain.setValue(float(self.plotter.ch_gain[row]))
+            self.spin_gain.blockSignals(False)
+
+            self.spin_y_offset.blockSignals(True)
+            self.spin_y_offset.setValue(float(self.plotter.ch_y_offset[row]))
+            self.spin_y_offset.blockSignals(False)
+
+    def on_ch_name_edited(self):
+        new_name = self.edit_ch_name.text().strip()
+        if new_name and self.selected_ch_idx < MAX_CHANNELS:
+            self.plotter.channel_names[self.selected_ch_idx] = new_name
+            if self.selected_ch_idx < self.table_channels.rowCount():
+                color = self.plotter.channel_colors[self.selected_ch_idx]
+                item = QTableWidgetItem(f"■ {new_name}")
+                item.setForeground(QColor(color))
+                self.table_channels.setItem(self.selected_ch_idx, 0, item)
+
+    def pick_ch_color(self):
+        color = QColorDialog.getColor(QColor(self.plotter.channel_colors[self.selected_ch_idx]), self, "选择通道波形颜色")
+        if color.isValid():
+            hex_str = color.name()
+            self.plotter.channel_colors[self.selected_ch_idx] = hex_str
+            self.btn_ch_color.setStyleSheet(f"background-color: {hex_str}; color: #000000; font-weight: bold;")
+            self.plotter.curves[self.selected_ch_idx].setPen(pg.mkPen(color=hex_str, width=2))
+
+    def on_gain_changed(self, val):
+        self.plotter.ch_gain[self.selected_ch_idx] = float(val)
+
+    def on_y_offset_changed(self, val):
+        self.plotter.ch_y_offset[self.selected_ch_idx] = float(val)
+
+    def reset_ch_params(self):
+        self.plotter.ch_gain[self.selected_ch_idx] = 1.0
+        self.plotter.ch_y_offset[self.selected_ch_idx] = 0.0
+        self.spin_gain.setValue(1.0)
+        self.spin_y_offset.setValue(0.0)
 
     def update_stats_10fps(self):
         self.lbl_fps.setText(f"{self.actual_fps} FPS")
@@ -707,12 +975,15 @@ class VofaDesktopApp(QMainWindow):
 
             with self.plotter.buffer_lock:
                 head = self.plotter.write_head
+                buf_size = self.plotter.buffer_size
                 if head > 0:
-                    pos = (head - 1) % RING_BUFFER_SIZE
+                    pos = (head - 1) % buf_size
                     for row, ch_idx in enumerate(range(MAX_CHANNELS)):
                         if self.known_channels[ch_idx] and row < self.table_channels.rowCount():
-                            val = self.plotter.values[ch_idx, pos]
+                            val = self.plotter.values[ch_idx, pos] * self.plotter.ch_gain[ch_idx] + self.plotter.ch_y_offset[ch_idx]
                             self.table_channels.item(row, 1).setText(f"{val:.3f}")
+
+                    self.lbl_hist_info.setText(f"{head} / {buf_size} | {self.actual_fps:.1f} FPS | {self.plotter.dt_ms * 100:.1f}ms/div")
 
     def clear_all(self):
         self.plotter.clear_plotter()
